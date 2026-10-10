@@ -1,0 +1,106 @@
+name: APK yig'ish
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+env:
+  # Sayt manzili (oxirida / bo'lsin). Boshqa domen bo'lsa shu yerni o'zgartiring.
+  BASE_URL: "https://birzum.asakaedu.uz/"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Loyiha papkasini topish (zip bo'lsa ochamiz)
+        id: root
+        run: |
+          set -e
+          if [ -f android-project.zip ] && [ ! -f settings.gradle.kts ]; then
+            mkdir -p _unz
+            unzip -q -o android-project.zip -d _unz
+            ROOT="$(dirname "$(find _unz -name settings.gradle.kts | head -n 1)")"
+          else
+            ROOT="."
+          fi
+          if [ ! -f "$ROOT/settings.gradle.kts" ]; then
+            echo "::error::Loyiha topilmadi. android-project.zip yuklanganmi?"
+            exit 1
+          fi
+          echo "root=$ROOT" >> "$GITHUB_OUTPUT"
+
+      - name: google-services.json
+        id: gs
+        env:
+          GS_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          set -e
+          ROOT="${{ steps.root.outputs.root }}"
+          if [ -n "$GS_JSON" ]; then
+            printf '%s' "$GS_JSON" > "$ROOT/app/google-services.json"
+          elif [ -f google-services.json ]; then
+            cp google-services.json "$ROOT/app/google-services.json"
+          elif [ ! -f "$ROOT/app/google-services.json" ]; then
+            echo "::error::google-services.json topilmadi. Uni repozitoriy ildiziga yuklang (yoki GOOGLE_SERVICES_JSON secret yarating)."
+            exit 1
+          fi
+          PKG="$(python3 -c "import json; d=json.load(open('$ROOT/app/google-services.json')); print(d['client'][0]['client_info']['android_client_info']['package_name'])")"
+          echo "Paket nomi (Firebase): $PKG"
+          echo "pkg=$PKG" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Android SDK paketlari
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Imzolash kaliti
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+        run: |
+          set -e
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            echo "KEYSTORE_PATH=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+            echo "KEYSTORE_PASSWORD=$KS_PASS" >> "$GITHUB_ENV"
+            echo "O'zingizning kalitingiz bilan imzolanadi"
+          else
+            echo "Kalit berilmagan: sinov kaliti bilan imzolanadi (o'rnatsa bo'ladi, do'konga yuklab bo'lmaydi)"
+            mkdir -p "$HOME/.android"
+            if [ ! -f "$HOME/.android/debug.keystore" ]; then
+              keytool -genkey -v -keystore "$HOME/.android/debug.keystore" -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+            fi
+          fi
+
+      - name: Yig'ish
+        working-directory: ${{ steps.root.outputs.root }}
+        run: >
+          gradle --no-daemon :app:assembleRelease :app:bundleRelease
+          -PappId="${{ steps.gs.outputs.pkg }}"
+          -PbaseUrl="$BASE_URL"
+          -PversionCode="${{ github.run_number }}"
+          --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: birzum-kuryer-apk
+          path: ${{ steps.root.outputs.root }}/app/build/outputs/apk/release/*.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: birzum-kuryer-aab
+          path: ${{ steps.root.outputs.root }}/app/build/outputs/bundle/release/*.aab
